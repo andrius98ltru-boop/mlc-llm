@@ -29,56 +29,60 @@ jobs:
             libvulkan-dev \
             vulkan-tools \
             openjdk-17-jdk \
+            git-lfs \
             curl \
-            unzip
+            unzip \
+            zstd
 
-      - name: Install TVM compiler
+          git lfs install
+          rustc --version
+          cargo --version
+          java -version
+          cmake --version
+
+      - name: Install prebuilt MLC compiler
         run: |
           python -m pip install --upgrade pip
+
           python -m pip install --pre -U \
             -f https://mlc.ai/wheels \
+            mlc-llm-nightly-cpu \
             mlc-ai-nightly-cpu
 
-          python -c "import tvm; print('TVM:', tvm.__file__)"
+          python -c "import tvm; print('TVM OK:', tvm.__file__)"
+          python -c "import mlc_llm; print('MLC LLM OK:', mlc_llm.__file__)"
+          python -m mlc_llm package --help
 
-      - name: Install MLC LLM Python package
-        run: |
-          python -m pip install \
-            numpy \
-            decorator \
-            attrs \
-            psutil \
-            scipy \
-            tornado \
-            typing_extensions \
-            ml_dtypes \
-            packaging \
-            cloudpickle
-
-          python -m pip install -e ./python
-
-          python -c "import mlc_llm; print('MLC LLM import OK')"
-
-      - name: Locate Android SDK and NDK
+      - name: Configure Android NDK
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-
-          ls -la "$ANDROID_HOME/ndk" || true
 
           NDK_DIR="$(find "$ANDROID_HOME/ndk" \
-            -mindepth 1 -maxdepth 1 -type d \
-            | sort -V | tail -1)"
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            | sort -V \
+            | tail -1)"
 
           if [ -z "$NDK_DIR" ]; then
             echo "Android NDK not found"
             exit 1
           fi
 
-          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
-          echo "TVM_NDK_CC=$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
+          echo "Using Android NDK: $NDK_DIR"
 
-          echo "Using NDK: $NDK_DIR"
+          echo "ANDROID_NDK=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "TVM_SOURCE_DIR=$GITHUB_WORKSPACE/3rdparty/tvm" >> "$GITHUB_ENV"
+
+          CC="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+
+          if [ ! -x "$CC" ]; then
+            echo "NDK clang not found: $CC"
+            exit 1
+          fi
+
+          echo "TVM_NDK_CC=$CC" >> "$GITHUB_ENV"
 
       - name: Create OMNILOQUI package config
         run: |
@@ -101,7 +105,7 @@ jobs:
 
           cat android/MLCChat/mlc-package-config.json
 
-      - name: Package Qwen3 Android runtime
+      - name: Build Qwen3 Android runtime
         working-directory: android/MLCChat
         env:
           MLC_JIT_POLICY: REDO
@@ -113,34 +117,44 @@ jobs:
             --mlc-llm-source-dir "$GITHUB_WORKSPACE" \
             --output dist
 
-      - name: Verify output
+      - name: Verify Android runtime
         working-directory: android/MLCChat
         run: |
-          test -f dist/lib/mlc4j/output/arm64-v8a/libtvm4j_runtime_packed.so
-          test -f dist/lib/mlc4j/output/tvm4j_core.jar
+          echo "===== DIST TREE ====="
+          find dist -maxdepth 5 -type f | sort | head -200
 
-          echo "===== runtime ====="
-          ls -lh dist/lib/mlc4j/output/arm64-v8a/libtvm4j_runtime_packed.so
+          test -f \
+            dist/lib/mlc4j/output/arm64-v8a/libtvm4j_runtime_packed.so
 
-          echo "===== TVM Java binding ====="
-          ls -lh dist/lib/mlc4j/output/tvm4j_core.jar
+          test -f \
+            dist/lib/mlc4j/output/tvm4j_core.jar
 
-          echo "===== MLC config ====="
-          cat dist/lib/mlc4j/src/main/assets/mlc-app-config.json
+          echo "===== RUNTIME ====="
+          ls -lh \
+            dist/lib/mlc4j/output/arm64-v8a/libtvm4j_runtime_packed.so
 
-          echo "===== model symbols ====="
+          echo "===== JAVA BINDING ====="
+          ls -lh \
+            dist/lib/mlc4j/output/tvm4j_core.jar
+
+          echo "===== APP CONFIG ====="
+          cat \
+            dist/lib/mlc4j/src/main/assets/mlc-app-config.json
+
+          echo "===== MODEL SYMBOLS ====="
           strings \
             dist/lib/mlc4j/output/arm64-v8a/libtvm4j_runtime_packed.so \
             | grep -iE 'qwen3|q4f16' \
-            | head -50 || true
+            | head -80 || true
 
       - name: Pack artifact
         working-directory: android/MLCChat
         run: |
-          tar -czf omniloqui-qwen3-android-mlc4j.tar.gz \
+          tar -czf \
+            omniloqui-qwen3-android-mlc4j.tar.gz \
             dist/lib/mlc4j
 
-      - name: Upload OMNILOQUI MLC runtime
+      - name: Upload OMNILOQUI Qwen3 runtime
         uses: actions/upload-artifact@v4
         with:
           name: omniloqui-qwen3-android-mlc4j
