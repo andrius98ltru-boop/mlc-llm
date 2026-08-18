@@ -49,6 +49,18 @@ jobs:
             mlc-llm-nightly-cpu \
             mlc-ai-nightly-cpu
 
+          python -m pip install -U \
+            psutil \
+            numpy \
+            scipy \
+            decorator \
+            attrs \
+            tornado \
+            typing_extensions \
+            ml_dtypes \
+            packaging \
+            cloudpickle
+
           python -c "import tvm; print('TVM OK:', tvm.__file__)"
           python -c "import mlc_llm; print('MLC LLM OK:', mlc_llm.__file__)"
           python -m mlc_llm package --help
