@@ -12,46 +12,54 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
+
+      - name: Pin compatible MLC revision
+        run: |
+          git checkout 2f78caa4
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+          echo "===== MLC ====="
+          git rev-parse HEAD
+
+          echo "===== TVM ====="
+          git -C 3rdparty/tvm rev-parse HEAD
+
+          grep -n "func.buffer_map.values"             python/mlc_llm/compiler_pass/low_batch_specialization.py
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
-      - name: Install system dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
+
           sudo apt-get install -y \
             cmake \
             ninja-build \
             clang \
             llvm \
+            llvm-dev \
+            lld \
+            libz-dev \
+            zlib1g-dev \
+            libxml2-dev \
             libvulkan-dev \
-            vulkan-tools \
             openjdk-17-jdk \
             git-lfs \
             curl \
             unzip \
             zstd
 
-          git lfs install
-          rustc --version
-          cargo --version
-          java -version
-          cmake --version
-
-      - name: Install prebuilt MLC compiler
-        run: |
           python -m pip install --upgrade pip
 
-          python -m pip install --pre -U \
-            -f https://mlc.ai/wheels \
-            mlc-llm-nightly-cpu \
-            mlc-ai-nightly-cpu
-
-          python -m pip install -U \
-            psutil \
+          python -m pip install \
             numpy \
+            cython \
+            psutil \
             scipy \
             decorator \
             attrs \
@@ -61,14 +69,121 @@ jobs:
             packaging \
             cloudpickle
 
-          python -c "import tvm; print('TVM OK:', tvm.__file__)"
-          python -c "import mlc_llm; print('MLC LLM OK:', mlc_llm.__file__)"
-          python -m mlc_llm package --help
+          git lfs install
+
+          llvm-config --version
+          cmake --version
+          python --version
+
+      - name: Verify source revisions
+        run: |
+          echo "===== MLC ====="
+          git rev-parse HEAD
+
+          echo "===== TVM ====="
+          git -C 3rdparty/tvm rev-parse HEAD
+
+
+      - name: Build matching TVM compiler
+        run: |
+          cd 3rdparty/tvm
+
+          rm -rf build
+          mkdir build
+          cd build
+
+          cp ../cmake/config.cmake .
+
+          cat >> config.cmake <<'CONFIG'
+          set(CMAKE_BUILD_TYPE Release)
+          set(USE_LLVM "llvm-config --ignore-libllvm --link-static")
+          set(HIDE_PRIVATE_SYMBOLS ON)
+          set(USE_CUDA OFF)
+          set(USE_ROCM OFF)
+          set(USE_METAL OFF)
+          set(USE_VULKAN OFF)
+          set(USE_OPENCL OFF)
+          set(USE_CUBLAS OFF)
+          set(USE_CUDNN OFF)
+          set(USE_CUTLASS OFF)
+          CONFIG
+
+          cmake .. -G Ninja
+          cmake --build . --parallel 2
+
+          test -f libtvm.so
+          test -f libtvm_runtime.so
+
+          ls -lh libtvm.so libtvm_runtime.so
+
+      - name: Configure matching TVM Python
+        run: |
+          python -m pip install \
+            ./3rdparty/tvm/3rdparty/tvm-ffi
+
+          echo "TVM_LIBRARY_PATH=$GITHUB_WORKSPACE/3rdparty/tvm/build" \
+            >> "$GITHUB_ENV"
+
+          echo "PYTHONPATH=$GITHUB_WORKSPACE/3rdparty/tvm/python:$GITHUB_WORKSPACE/python" \
+            >> "$GITHUB_ENV"
+
+      - name: Build MLC LLM host library
+        run: |
+          rm -rf build-host
+          mkdir build-host
+          cd build-host
+
+          python ../cmake/gen_cmake_config.py <<'ANSWERS' || true
+
+
+
+          ANSWERS
+
+          cmake .. \
+            -DTVM_SOURCE_DIR="$GITHUB_WORKSPACE/3rdparty/tvm" \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake --build . --parallel 2
+
+          find . -maxdepth 3 \
+            -type f \
+            -name 'libmlc_llm.so' \
+            -print
+
+      - name: Configure MLC Python
+        run: |
+          MLC_LIB="$(find "$GITHUB_WORKSPACE/build-host" \
+            -type f \
+            -name libmlc_llm.so \
+            | head -1)"
+
+          if [ -z "$MLC_LIB" ]; then
+            echo "libmlc_llm.so not found"
+            exit 1
+          fi
+
+          MLC_LIB_DIR="$(dirname "$MLC_LIB")"
+
+          echo "MLC_LIBRARY_PATH=$MLC_LIB_DIR" \
+            >> "$GITHUB_ENV"
+
+          echo "LD_LIBRARY_PATH=$MLC_LIB_DIR:$GITHUB_WORKSPACE/3rdparty/tvm/build" \
+            >> "$GITHUB_ENV"
+
+      - name: Validate MLC compiler
+        run: |
+          python - <<'PY'
+          import tvm
+          import mlc_llm
+
+          print("TVM:", tvm.__file__)
+          print("MLC:", mlc_llm.__file__)
+          PY
+
+          python -m mlc_llm compile --help | head -40
 
       - name: Configure Android NDK
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
-
           NDK_DIR="$(find "$ANDROID_HOME/ndk" \
             -mindepth 1 \
             -maxdepth 1 \
@@ -81,20 +196,16 @@ jobs:
             exit 1
           fi
 
-          echo "Using Android NDK: $NDK_DIR"
+          echo "Using NDK: $NDK_DIR"
 
           echo "ANDROID_NDK=$NDK_DIR" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
-          echo "TVM_SOURCE_DIR=$GITHUB_WORKSPACE/3rdparty/tvm" >> "$GITHUB_ENV"
 
-          CC="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          echo "TVM_SOURCE_DIR=$GITHUB_WORKSPACE/3rdparty/tvm" \
+            >> "$GITHUB_ENV"
 
-          if [ ! -x "$CC" ]; then
-            echo "NDK clang not found: $CC"
-            exit 1
-          fi
-
-          echo "TVM_NDK_CC=$CC" >> "$GITHUB_ENV"
+          echo "TVM_NDK_CC=$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+            >> "$GITHUB_ENV"
 
       - name: Create OMNILOQUI package config
         run: |
@@ -132,32 +243,28 @@ jobs:
       - name: Verify Android runtime
         working-directory: android/MLCChat
         run: |
-          echo "===== DIST TREE ====="
-          find dist -maxdepth 5 -type f | sort | head -200
-
           test -f \
             dist/lib/mlc4j/output/arm64-v8a/libtvm4j_runtime_packed.so
 
           test -f \
             dist/lib/mlc4j/output/tvm4j_core.jar
 
-          echo "===== RUNTIME ====="
+          echo "===== runtime ====="
+
           ls -lh \
             dist/lib/mlc4j/output/arm64-v8a/libtvm4j_runtime_packed.so
 
-          echo "===== JAVA BINDING ====="
-          ls -lh \
-            dist/lib/mlc4j/output/tvm4j_core.jar
+          echo "===== app config ====="
 
-          echo "===== APP CONFIG ====="
           cat \
             dist/lib/mlc4j/src/main/assets/mlc-app-config.json
 
-          echo "===== MODEL SYMBOLS ====="
+          echo "===== qwen symbols ====="
+
           strings \
             dist/lib/mlc4j/output/arm64-v8a/libtvm4j_runtime_packed.so \
             | grep -iE 'qwen3|q4f16' \
-            | head -80 || true
+            | head -100 || true
 
       - name: Pack artifact
         working-directory: android/MLCChat
@@ -166,7 +273,7 @@ jobs:
             omniloqui-qwen3-android-mlc4j.tar.gz \
             dist/lib/mlc4j
 
-      - name: Upload OMNILOQUI Qwen3 runtime
+      - name: Upload OMNILOQUI runtime
         uses: actions/upload-artifact@v4
         with:
           name: omniloqui-qwen3-android-mlc4j
