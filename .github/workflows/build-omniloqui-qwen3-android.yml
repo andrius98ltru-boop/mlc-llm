@@ -43,6 +43,7 @@ jobs:
             clang \
             llvm \
             llvm-dev \
+            libpolly-18-dev \
             lld \
             libz-dev \
             zlib1g-dev \
